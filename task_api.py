@@ -1,118 +1,100 @@
 import asyncio
-import time
+import logging
 import uuid
-from typing import Dict, Optional, List
+from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, Field
-import jwt
+from fastapi import FastAPI, Depends, HTTPException
+from sqlalchemy.exc import SQLAlchemyError
 
-# ===================== CONFIG =====================
-SECRET_KEY = "supersecret"
-ALGORITHM = "HS256"
-RATE_LIMIT = 5  # requests per second
+from auth import authenticate_user, create_token, verify_token
+from config import LOG_FILE
+from database import SessionLocal, Task as DbTask, get_db, init_db
+from models import TaskCreate, TaskStatus, LoginRequest, TaskState
+from storage import rate_limiter, queue
+from worker import worker
 
-app = FastAPI()
-security = HTTPBearer()
-
-# ===================== MODELS =====================
-class TaskCreate(BaseModel):
-    data: str = Field(..., min_length=1, max_length=1000)
-
-class TaskStatus(BaseModel):
-    id: str
-    status: str
-    result: Optional[str] = None
-
-# ===================== STORAGE =====================
-tasks: Dict[str, dict] = {}
-queue: asyncio.Queue[str] = asyncio.Queue()
-rate_limit_store: Dict[str, List[float]] = {}
-
-# ===================== AUTH =====================
-def create_token(username: str) -> str:
-    payload = {"sub": username, "exp": time.time() + 3600}
-    token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-    if isinstance(token, bytes):
-        token = token.decode("utf-8")
-    return token
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+logger = logging.getLogger("task_app")
 
 
-def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    try:
-        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
-        username = payload.get("sub")
-        if not username:
-            raise HTTPException(status_code=401, detail="Invalid token payload")
-        return username
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    logger.info("Database initialized")
 
-# ===================== RATE LIMIT =====================
-def rate_limiter(request: Request):
-    ip = request.client.host if request.client else "unknown"
-    now = time.time()
-    timestamps = rate_limit_store.setdefault(ip, [])
+    with SessionLocal() as db:
+        pending_tasks = db.query(DbTask).filter(
+            DbTask.status.in_([TaskState.pending.value, TaskState.processing.value])
+        ).all()
 
-    rate_limit_store[ip] = [t for t in timestamps if now - t < 1]
+        for stored_task in pending_tasks:
+            stored_task.status = TaskState.pending.value
+            await queue.put(stored_task.id)
 
-    if len(rate_limit_store[ip]) >= RATE_LIMIT:
-        raise HTTPException(status_code=429, detail="Too many requests")
+        if pending_tasks:
+            db.commit()
+            logger.info("Requeued %d tasks from the database", len(pending_tasks))
 
-    rate_limit_store[ip].append(now)
-
-# ===================== WORKER =====================
-async def worker() -> None:
-    while True:
-        task_id = await queue.get()
-        tasks[task_id]["status"] = "processing"
-
-        await asyncio.sleep(2)
-        result = tasks[task_id]["data"].upper()
-
-        tasks[task_id]["status"] = "done"
-        tasks[task_id]["result"] = result
-
-        queue.task_done()
-
-
-@app.on_event("startup")
-async def startup_event() -> None:
     asyncio.create_task(worker())
+    yield
 
-# ===================== ROUTES =====================
+
+app = FastAPI(lifespan=lifespan)
+
+
 @app.post("/token")
-async def login(username: str):
-    return {"access_token": create_token(username)}
+async def login(login_request: LoginRequest):
+    if not authenticate_user(login_request.username, login_request.password):
+        logger.warning("Unauthorized login attempt for user %s", login_request.username)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = create_token(login_request.username)
+    logger.info("Token created for user %s", login_request.username)
+    return {"access_token": token}
 
 
 @app.post("/tasks", dependencies=[Depends(rate_limiter)])
-async def create_task(task: TaskCreate, user: str = Depends(verify_token)):
+async def create_task(task: TaskCreate, user: str = Depends(verify_token), db=Depends(get_db)):
     task_id = str(uuid.uuid4())
-    tasks[task_id] = {
-        "status": "pending",
-        "data": task.data,
-        "result": None,
-        "user": user,
-    }
+    db_task = DbTask(id=task_id, status=TaskState.pending.value, data=task.data, result=None, user=user)
 
-    await queue.put(task_id)
-    return {"task_id": task_id}
+    try:
+        db.add(db_task)
+        db.commit()
+        db.refresh(db_task)
+        await queue.put(task_id)
+        logger.info("Task %s created by user %s", task_id, user)
+        return {"task_id": task_id}
+    except SQLAlchemyError as err:
+        db.rollback()
+        logger.exception("Database error while creating task %s", task_id)
+        raise HTTPException(status_code=500, detail="Failed to create task") from err
 
 
 @app.get("/tasks/{task_id}", response_model=TaskStatus, dependencies=[Depends(rate_limiter)])
-async def get_task(task_id: str, user: str = Depends(verify_token)):
-    task = tasks.get(task_id)
+async def get_task(task_id: str, user: str = Depends(verify_token), db=Depends(get_db)):
+    try:
+        task = db.get(DbTask, task_id)
+    except SQLAlchemyError as err:
+        logger.exception("Database error while reading task %s", task_id)
+        raise HTTPException(status_code=500, detail="Failed to retrieve task") from err
+
     if not task:
+        logger.warning("Task %s not found for user %s", task_id, user)
         raise HTTPException(status_code=404, detail="Task not found")
 
-    if task["user"] != user:
+    if task.user != user:
+        logger.warning("Forbidden access to task %s by user %s", task_id, user)
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    return TaskStatus(id=task_id, status=task["status"], result=task["result"])
+    return TaskStatus(id=task.id, status=task.status, result=task.result)
 
-# ===================== RUN =====================
+
 # uvicorn task_api:app --reload
