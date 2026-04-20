@@ -6,14 +6,25 @@ import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from config import ACCESS_TOKEN_EXPIRE_SECONDS, ALGORITHM, SECRET_KEY
+from config import ACCESS_TOKEN_EXPIRE_SECONDS, ALGORITHM, SECRET_KEY, USER_CREDENTIALS
 
 security = HTTPBearer()
 
-USER_PASSWORDS: Dict[str, bytes] = {
-    "alice": bcrypt.hashpw("alice123".encode(), bcrypt.gensalt()),
-    "bob": bcrypt.hashpw("bobPassword".encode(), bcrypt.gensalt()),
-}
+
+def parse_user_credentials(raw: str) -> Dict[str, bytes]:
+    user_map: Dict[str, bytes] = {}
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        username, sep, password = entry.partition(":")
+        if not sep or not username or not password:
+            continue
+        user_map[username.strip()] = bcrypt.hashpw(password.strip().encode(), bcrypt.gensalt())
+    return user_map
+
+
+USER_PASSWORDS = parse_user_credentials(USER_CREDENTIALS)
 
 
 def verify_password(plain_password: str, hashed_password: bytes) -> bool:
